@@ -1,0 +1,24 @@
+# Local machine and editors
+.DS_Store
+.idea/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local
+*.local.*
+
+# Dependencies and generated files
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+dist/
+coverage/
+*.log
+
+# Local artifacts and scratch work
+/output/
+/tmp/
