@@ -1,3 +1,5 @@
+import { messageContent } from "./message-content.js";
+import { isUserAllowed } from "./access.js";
 import type { Binding } from "./config.js";
 import type { Host } from "./host.js";
 import { digest, type Inbound } from "./contracts.js";
@@ -36,9 +38,8 @@ export class MessageRecovery {
   async poll() {
     const config = structuredClone(this.host.config),
       fingerprint = digest(config);
-    for (const b of config.bindings) {
-      if (!b.allowSend || b.threadId !== null || !b.allowedUsers.length)
-        continue;
+    for (const b of this.host.bindings()) {
+      if (!b.allowSend || b.threadId !== null) continue;
       if (this.stopped || !this.ready()) return;
       const key = `message-recovery:${b.id}`;
       const row = this.host.store.db
@@ -58,7 +59,17 @@ export class MessageRecovery {
       }
       const until = cursor.until ?? Date.now() - 2000;
       if (until <= cursor.since) continue;
-      const page = await this.history(b, cursor.since, until, cursor.page);
+      let page: HistoryPage;
+      try {
+        page = await this.history(b, cursor.since, until, cursor.page);
+      } catch {
+        this.log({
+          kind: "message_recovery_failed",
+          botId: b.botId,
+          bindingId: b.id,
+        });
+        continue;
+      }
       if (
         this.stopped ||
         !this.ready() ||
@@ -75,7 +86,7 @@ export class MessageRecovery {
           m.chat_id !== b.chatId ||
           m.deleted ||
           m.updated ||
-          m.msg_type !== "text" ||
+          !["text", "post", "image"].includes(m.msg_type) ||
           m.thread_id ||
           m.root_id ||
           m.upper_message_id ||
@@ -91,7 +102,7 @@ export class MessageRecovery {
           m.sender?.sender_type !== "user" ||
           m.sender?.id_type !== "open_id" ||
           m.sender?.tenant_key !== bot.tenantKey ||
-          !b.allowedUsers.includes(m.sender.id) ||
+          !isUserAllowed(bot, m.sender.id, b) ||
           typeof m.message_id !== "string"
         )
           continue;
@@ -101,13 +112,14 @@ export class MessageRecovery {
             .get(`native:${b.botId}`, m.message_id)
         )
           continue;
-        let text: unknown;
+        let content: ReturnType<typeof messageContent>;
         try {
-          text = JSON.parse(m.body?.content).text;
+          content = messageContent(m.msg_type, m.body?.content);
         } catch {
           continue;
         }
-        if (typeof text !== "string" || /@_all|<at\b/.test(text)) continue;
+        const text = content.text;
+        if (/@_all|<at\b/.test(text)) continue;
         const result = this.receive({
           botId: b.botId,
           nativeId: m.message_id,
@@ -117,6 +129,7 @@ export class MessageRecovery {
           senderId: m.sender.id,
           senderType: "human",
           text,
+          imageKeys: content.imageKeys.length ? content.imageKeys : undefined,
           mentions: (m.mentions ?? []).map((mention: any) => mention.id),
           ...(m.mentions?.length
             ? {

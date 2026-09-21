@@ -213,7 +213,9 @@ export function createControlHandler(options: {
       }
       if (
         options.connection &&
-        route === "/api/conversations/authorize" &&
+        ["/api/conversations/authorize", "/api/access/authorize"].includes(
+          route,
+        ) &&
         req.method === "POST"
       ) {
         const input = z
@@ -225,12 +227,19 @@ export function createControlHandler(options: {
       }
       if (
         options.connection &&
-        route === "/api/conversations/revoke" &&
+        ["/api/conversations/revoke", "/api/access/revoke"].includes(route) &&
         req.method === "POST"
       ) {
         const input = z
           .object({
-            bindingId: z.string().regex(/^[A-Za-z0-9_-]{1,100}$/),
+            botId: z
+              .string()
+              .regex(/^[A-Za-z0-9_-]{1,100}$/)
+              .optional(),
+            bindingId: z
+              .string()
+              .regex(/^[A-Za-z0-9_-]{1,100}$/)
+              .optional(),
             userId: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/),
             revision: z.string().max(128),
           })
@@ -239,8 +248,31 @@ export function createControlHandler(options: {
         json(
           200,
           options.connection.revoke(
-            input.bindingId,
+            input.botId ?? input.bindingId ?? "",
             input.userId,
+            input.revision,
+          ),
+        );
+        return;
+      }
+      if (
+        options.connection &&
+        route === "/api/access/everyone" &&
+        req.method === "POST"
+      ) {
+        const input = z
+          .object({
+            botId: z.string().regex(/^[A-Za-z0-9_-]{1,100}$/),
+            allowAllUsers: z.boolean(),
+            revision: z.string().max(128),
+          })
+          .strict()
+          .parse(await body(req));
+        json(
+          200,
+          options.connection.setEveryone(
+            input.botId,
+            input.allowAllUsers,
             input.revision,
           ),
         );
@@ -267,13 +299,7 @@ export function createControlHandler(options: {
       ) {
         const users: { botId: string; userId: string; name?: string }[] = [];
         for (const bot of host.config.bots) {
-          const ids = [
-            ...new Set(
-              host.config.bindings
-                .filter((b) => b.botId === bot.id)
-                .flatMap((b) => b.allowedUsers),
-            ),
-          ];
+          const ids = bot.allowedUsers ?? [];
           if (!ids.length) continue;
           let call: Awaited<ReturnType<typeof createLarkApi>> | undefined;
           try {
@@ -405,7 +431,7 @@ export function createControlHandler(options: {
             name: p.name,
             root: p.root,
           })),
-          bindings: host.config.bindings.map((b) => ({
+          bindings: host.bindings().map((b) => ({
             id: b.id,
             projectId: b.projectId,
             allowSend: b.allowSend,
@@ -419,8 +445,7 @@ export function createControlHandler(options: {
               agentId: r.agentId,
               projectId:
                 r.local?.projectId ??
-                host.config.bindings.find((b) => b.id === r.bindingId)
-                  ?.projectId,
+                host.bindings().find((b) => b.id === r.bindingId)?.projectId,
               source: r.local ? "local" : "lark",
               title: r.prompt.slice(0, 100),
               state: r.state,
@@ -460,8 +485,7 @@ export function createControlHandler(options: {
               (d) =>
                 d.data.replyTo === run.nativeId &&
                 d.data.botId ===
-                  host.config.bindings.find((b) => b.id === run.bindingId)
-                    ?.botId,
+                  host.bindings().find((b) => b.id === run.bindingId)?.botId,
             ),
         });
         return;

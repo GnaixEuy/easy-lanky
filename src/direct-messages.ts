@@ -1,3 +1,4 @@
+import { isUserAllowed } from "./access.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Store } from "./store.js";
 import type { ContactResult, Contact } from "./contacts.js";
@@ -120,7 +121,7 @@ export class DirectMessages {
     selected: number,
     authorization: "explicit_request" | "selection",
   ) {
-    if (!b.allowSend || !b.allowedUsers.includes(p.owner))
+    if (!b.allowSend || !isUserAllowed(bot, p.owner, b))
       throw new Error("direct_send_not_authorized");
     p.state = "confirmed";
     p.selected = selected;
@@ -166,7 +167,7 @@ export class DirectMessages {
       p.contacts[p.selected!]?.openId === d.direct?.openId &&
       p.identity === identity(b, bot) &&
       b.allowSend &&
-      b.allowedUsers.includes(p.owner) &&
+      isUserAllowed(bot, p.owner, b) &&
       digest(p.conversation) === digest(conversation)
     );
   }

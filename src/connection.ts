@@ -1,3 +1,4 @@
+import { isUserAllowed } from "./access.js";
 import { randomUUID } from "node:crypto";
 import type { ConfigurationManager } from "./configuration.js";
 import type { Inbound } from "./contracts.js";
@@ -34,7 +35,13 @@ export class ConnectionService {
   }
   snapshot() {
     for (const [id, c] of this.candidates)
-      if (c.expiresAt <= Date.now()) this.candidates.delete(id);
+      if (
+        c.expiresAt <= Date.now() ||
+        this.manager.host.config.bots.some(
+          (b) => b.id === c.botId && isUserAllowed(b, c.senderId),
+        )
+      )
+        this.candidates.delete(id);
     return {
       mode: this.offline ? "offline" : "lark",
       busy: this.busy,
@@ -44,10 +51,17 @@ export class ConnectionService {
     };
   }
   async connect() {
-    this.manager.assertIdle();
+    if (this.manager.busy) throw new Error("connection_busy");
+    // Reconnect unchanged configuration even with durable work awaiting transport.
+    // Reconfiguration and in-flight execution/delivery still require an idle host.
+    if (
+      this.manager.pendingRestart ||
+      this.manager.host.active.size ||
+      this.manager.host.store.deliveries().some((d) => d.state === "sending")
+    )
+      this.manager.assertIdle();
     if (this.closing) throw new Error("host_stopping");
     const config = this.manager.snapshot().config;
-    if (!config.bots.length) throw new Error("no_bots_configured");
     this.manager.busy = true;
     this.offline = true;
     try {
@@ -66,9 +80,11 @@ export class ConnectionService {
         .prepare("INSERT OR REPLACE INTO meta VALUES (?,?)")
         .run("config", digest(config));
       this.candidates.clear();
-      await this.transport.connect();
-      if (this.closing) throw new Error("host_stopping");
-      this.offline = false;
+      if (config.bots.length) {
+        await this.transport.connect();
+        if (this.closing) throw new Error("host_stopping");
+        this.offline = false;
+      }
     } catch {
       await this.transport.disconnect();
       throw new Error("lark_connection_failed");
@@ -105,11 +121,7 @@ export class ConnectionService {
     ) {
       this.snapshot();
       const prior = [...this.candidates.values()].find(
-        (c) =>
-          c.botId === event.botId &&
-          c.chatId === event.chatId &&
-          c.threadId === event.threadId &&
-          c.senderId === event.senderId,
+        (c) => c.botId === event.botId && c.senderId === event.senderId,
       );
       if (prior || this.candidates.size < 100) {
         const id = prior?.id ?? randomUUID();
@@ -127,25 +139,56 @@ export class ConnectionService {
     }
     return result;
   }
-  revoke(bindingId: string, userId: string, revision: string) {
+  revoke(botId: string, userId: string, revision: string) {
     this.manager.assertIdle();
     if (this.closing) throw new Error("host_stopping");
     if (this.manager.pendingRestart) throw new Error("config_restart_required");
     const config = this.manager.snapshot().config;
-    const binding = config.bindings.find((b) => b.id === bindingId);
-    if (!binding?.allowedUsers.includes(userId))
+    // Accept an old client's binding ID, but revoke the person across the whole bot.
+    const bot =
+      config.bots.find((b) => b.id === botId) ??
+      config.bots.find(
+        (b) =>
+          b.id ===
+          config.bindings.find((binding) => binding.id === botId)?.botId,
+      );
+    if (!bot?.allowedUsers?.includes(userId))
       throw new Error("user_not_authorized");
-    binding.allowedUsers = binding.allowedUsers.filter((id) => id !== userId);
+    bot.allowedUsers = bot.allowedUsers.filter((id) => id !== userId);
+    for (const binding of config.bindings.filter((b) => b.botId === bot.id))
+      binding.allowedUsers = binding.allowedUsers.filter((id) => id !== userId);
     this.manager.save(config, revision);
     this.manager.host.config.bindings = config.bindings;
+    this.manager.host.config.bots = config.bots;
     this.manager.host.store.db
       .prepare("INSERT OR REPLACE INTO meta VALUES (?,?)")
       .run("config", digest(this.manager.host.config));
     this.manager.host.store.audit(
       "access_revoked",
-      bindingId,
+      bot.id,
       JSON.stringify({ userId }),
     );
+    return this.manager.snapshot();
+  }
+  setEveryone(botId: string, allowAllUsers: boolean, revision: string) {
+    this.manager.assertIdle();
+    if (this.closing) throw new Error("host_stopping");
+    if (this.manager.pendingRestart) throw new Error("config_restart_required");
+    const config = this.manager.snapshot().config;
+    const bot = config.bots.find((b) => b.id === botId);
+    if (!bot) throw new Error("bot_missing");
+    bot.allowAllUsers = allowAllUsers;
+    const saved = this.manager.save(config, revision);
+    this.manager.host.config.bots = saved.config.bots;
+    this.manager.host.store.db
+      .prepare("INSERT OR REPLACE INTO meta VALUES (?,?)")
+      .run("config", digest(this.manager.host.config));
+    this.manager.host.store.audit(
+      "access_policy_changed",
+      botId,
+      JSON.stringify({ allowAllUsers }),
+    );
+    this.snapshot();
     return this.manager.snapshot();
   }
   authorize(id: string, revision: string) {
@@ -158,6 +201,9 @@ export class ConnectionService {
     const config = this.manager.snapshot().config;
     const bot = config.bots.find((b) => b.id === candidate.botId);
     if (!bot?.projectId) throw new Error("invalid_local_scope");
+    bot.allowedUsers = [
+      ...new Set([...(bot.allowedUsers ?? []), candidate.senderId]),
+    ];
     const existing = config.bindings.find(
       (b) =>
         b.botId === candidate.botId &&
@@ -194,6 +240,7 @@ export class ConnectionService {
         JSON.stringify({ since: Date.now() }),
       );
     this.manager.host.config.bindings = config.bindings;
+    this.manager.host.config.bots = config.bots;
     this.manager.host.store.db
       .prepare("INSERT OR REPLACE INTO meta VALUES (?,?)")
       .run("config", digest(this.manager.host.config));

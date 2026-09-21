@@ -29,6 +29,8 @@ const botSchema = z
     appId: nativeId,
     appSecretEnv: z.string().regex(/^[A-Z][A-Z0-9_]*$/),
     selfOpenId: nativeId,
+    allowedUsers: z.array(nativeId).optional(),
+    allowAllUsers: z.boolean().optional(),
     peers: z
       .record(
         id,
@@ -79,7 +81,18 @@ export const configSchema = z
     ),
     bindings: z.array(bindingSchema),
   })
-  .strict();
+  .strict()
+  .transform((config) => {
+    for (const bot of config.bots)
+      bot.allowedUsers ??= [
+        ...new Set(
+          config.bindings
+            .filter((b) => b.botId === bot.id)
+            .flatMap((b) => b.allowedUsers),
+        ),
+      ];
+    return config;
+  });
 export type Config = z.infer<typeof configSchema>;
 export type Bot = Config["bots"][number];
 export type Binding = Config["bindings"][number];

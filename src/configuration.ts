@@ -117,7 +117,11 @@ export class ConfigurationManager {
         existing.tenantKey !== identity.tenantKey);
     if (identityChanged && cfg.bindings.some((b) => b.botId === input.id))
       throw new Error("bot_replacement_requires_review");
-    if (identityChanged) bot.peers = {};
+    if (identityChanged) {
+      bot.peers = {};
+      bot.allowedUsers = [];
+      bot.allowAllUsers = false;
+    }
     bot.peers = Object.fromEntries(
       Object.entries(bot.peers).filter(([agent]) => agent !== bot.agentId),
     );

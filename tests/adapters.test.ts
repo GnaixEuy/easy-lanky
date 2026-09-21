@@ -137,3 +137,42 @@ test("per-execution robot model overrides Agent default without mutating shared 
     assert.equal(s.adapter.agent.model, "agent-default");
   }
 });
+
+test("Codex reconnect errors require a subsequent valid result and completed turn", () => {
+  const reconnect = {
+    type: "error",
+    message:
+      "Reconnecting... 2/5 (stream disconnected before completion: tls handshake eof)",
+  };
+  const result = {
+    type: "item.completed",
+    item: { type: "agent_message", text: decision },
+  };
+  const completed = { type: "turn.completed" };
+  const parse = (events: unknown[]) =>
+    parseOutput("codex", events.map((e) => JSON.stringify(e)).join("\n"));
+  assert.equal(parse([reconnect, result, completed]).decision.text, "ok");
+  for (const events of [
+    [reconnect],
+    [reconnect, result],
+    [result, completed, reconnect],
+    [result, reconnect, completed],
+    [reconnect, result, { type: "turn.failed" }],
+    [{ type: "error", message: "fatal" }, result, completed],
+  ]) {
+    assert.throws(() => parse(events));
+  }
+});
+
+test("Codex receives downloaded images as native image arguments", async (t) => {
+  const s = stub(
+    t,
+    `process.stdin.resume();process.stdin.on('end',()=>{const args=process.argv.slice(2);const at=args.indexOf('--image');const fs=require('node:fs');const ok=at>=0&&fs.readFileSync(args[at+1])[0]===137;console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({text:ok?'image attached':'missing',delegate:null})}}));console.log(JSON.stringify({type:'turn.completed'}));});`,
+  );
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aC9sAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const result = await s.adapter.execute({ ...s.input, images: [png] });
+  assert.equal(result.decision.text, "image attached");
+});

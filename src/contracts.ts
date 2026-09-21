@@ -24,6 +24,8 @@ export const envelopeSchema = z
   .strict();
 export type Envelope = z.infer<typeof envelopeSchema>;
 export interface Inbound {
+  parentId?: string;
+  imageKeys?: string[];
   userMentions?: Array<import("./contacts.js").Contact & { key: string }>;
   botId: string;
   nativeId: string;
@@ -47,11 +49,23 @@ export interface Delivery {
   threadId: string | null;
   replyTo: string;
   mentionId?: string;
+  mentionIds?: string[];
+  replyInThread?: boolean | null;
+  replyBotIds?: string[];
+  returnMentionId?: string;
   text: string;
   envelope?: Envelope;
   status?: "accepted" | "result" | "failed" | "cancelled";
 }
 export interface Transport {
+  readContext?(
+    botId: string,
+    chatId: string,
+    messageId: string,
+    parentId?: string,
+    imageKeys?: string[],
+  ): Promise<import("./message-content.js").MessageContext>;
+  readyToSend?(botId: string): boolean;
   runTool?(
     botId: string,
     request: import("./lark-tools.js").LarkToolRequest,
@@ -72,6 +86,10 @@ export type RunState =
   | "cancelled"
   | "interrupted";
 export interface Run {
+  sender?: { type: Inbound["senderType"]; id: string };
+  parentId?: string;
+  imageKeys?: string[];
+  externalReply?: boolean;
   toolApproval?: string;
   mentionedContacts?: import("./contacts.js").Contact[];
   conversation?: { scope: string; epoch: string };
@@ -110,14 +128,22 @@ export function parseEnvelope(text: string): Envelope | null {
   );
 }
 export function wireText(d: Delivery): string {
-  // Only registry-generated mentions may be active. Model output cannot inject mentions.
+  // Only registry or Host-validated member IDs become active mentions.
   const safe = d.text.replace(/</g, "＜").replace(/>/g, "＞");
   const mention = d.mentionId ? `<at user_id="${d.mentionId}"></at>\n` : "";
+  const members = (d.mentionIds ?? [])
+    .filter((id) => /^ou_[A-Za-z0-9_-]+$/.test(id))
+    .map((id) => `<at user_id="${id}"></at>`)
+    .join(" ");
   return (
     mention +
+    (members ? members + "\n" : "") +
     (d.envelope
       ? `[easy-larky:v1]\n${JSON.stringify(d.envelope).replace(/</g, "\\u003c").replace(/>/g, "\\u003e")}`
-      : safe)
+      : safe +
+        (d.returnMentionId && /^ou_[A-Za-z0-9_-]+$/.test(d.returnMentionId)
+          ? `\n回复时请 @ 我：<at user_id="${d.returnMentionId}"></at>，这样我才能收到。`
+          : ""))
   );
 }
 export const decisionSchema = z
@@ -137,7 +163,20 @@ export const decisionSchema = z
       .nullable()
       .optional(),
     messages: z
-      .array(z.string().trim().min(1).max(4000))
+      .array(
+        z.union([
+          z.string().trim().min(1).max(4000),
+          z
+            .object({
+              text: z.string().trim().min(1).max(4000),
+              replyInThread: z.boolean().nullable().optional(),
+              mentionIds: z
+                .array(z.string().regex(/^ou_[A-Za-z0-9_-]+$/))
+                .max(10),
+            })
+            .strict(),
+        ]),
+      )
       .min(1)
       .max(5)
       .nullable()
@@ -190,7 +229,28 @@ export const decisionJsonSchema = {
           type: "array",
           minItems: 1,
           maxItems: 5,
-          items: { type: "string", minLength: 1, maxLength: 4000 },
+          items: {
+            anyOf: [
+              { type: "string", minLength: 1, maxLength: 4000 },
+              {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  text: { type: "string", minLength: 1, maxLength: 4000 },
+                  replyInThread: {
+                    anyOf: [{ type: "boolean" }, { type: "null" }],
+                  },
+                  mentionIds: {
+                    type: "array",
+                    minItems: 0,
+                    maxItems: 10,
+                    items: { type: "string", pattern: "^ou_[A-Za-z0-9_-]+$" },
+                  },
+                },
+                required: ["text", "mentionIds", "replyInThread"],
+              },
+            ],
+          },
         },
       ],
     },

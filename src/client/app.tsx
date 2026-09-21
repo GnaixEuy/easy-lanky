@@ -6,6 +6,9 @@ import {
 } from "./WorkspaceSettings.js";
 import { ConnectionPanel } from "./ConnectionPanel.js";
 import { SetupError } from "./SetupError.js";
+import { BotList } from "./bots/BotList.js";
+import { BotDetail } from "./bots/BotDetail.js";
+import { AddBotView } from "./bots/AddBotView.js";
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -112,6 +115,7 @@ function agentLabel(cfg: Config, id: string) {
 function App() {
   const [view, setView] = useState<View>("robots");
   const [state, setState] = useState<any>(null);
+  const [connectionState, setConnectionState] = useState<any>(null);
   const [configuration, setConfiguration] = useState<Configuration | null>(
     null,
   );
@@ -129,8 +133,22 @@ function App() {
       ? { ...draft, secret: "" }
       : null;
   });
+  const selectedBotKey = "easy-larky-selected-bot";
+  const [selectedBotId, setSelectedBotIdState] = useState<string | null>(() =>
+    stored<string>(selectedBotKey),
+  );
+  const [initialBotTab, setInitialBotTab] = useState<string | undefined>(
+    undefined,
+  );
+  const [isAddingBot, setIsAddingBot] = useState(false);
   const loaded = useRef(false);
   const alive = useRef(true);
+
+  function setSelectedBotId(id: string | null) {
+    if (id) sessionStorage.setItem(selectedBotKey, JSON.stringify(id));
+    else sessionStorage.removeItem(selectedBotKey);
+    setSelectedBotIdState(id);
+  }
 
   async function reloadConfiguration() {
     const data = await api<Configuration>("/api/config");
@@ -139,6 +157,13 @@ function App() {
       setConfiguration(data);
       setRegistrations(pending);
     }
+  }
+
+  async function refreshConnection() {
+    try {
+      const conn = await api("/api/connection");
+      if (alive.current) setConnectionState(conn);
+    } catch {}
   }
 
   async function refresh() {
@@ -152,6 +177,8 @@ function App() {
         await reloadConfiguration();
         loaded.current = true;
       }
+      const conn = await api("/api/connection").catch(() => null);
+      if (alive.current && conn) setConnectionState(conn);
     } catch (e) {
       if (!alive.current) return;
       if (e instanceof ApiError && e.status === 401) {
@@ -160,6 +187,127 @@ function App() {
         loaded.current = false;
       }
       setError(e);
+    }
+  }
+
+  async function saveBotDraft(draft: {
+    id: string;
+    name: string;
+    agentId: string;
+    model: string | null;
+    projectId: string;
+    tenant: "feishu" | "lark";
+    appId: string;
+    secret: string;
+  }) {
+    if (!configuration || busy) return false;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api("/api/robots", {
+        ...draft,
+        revision: configuration.revision,
+      });
+      if (result.registration) {
+        setRobot({ ...draft, secret: "" });
+        setConnecting(true);
+        setIsAddingBot(false);
+        setNotice("");
+        await reloadConfiguration();
+        return false;
+      }
+      setConfiguration(result);
+      await refreshConnection();
+      setNotice(
+        result.pendingRestart
+          ? "机器人已保存。点击“应用设置并上线”，通道将重新连接。"
+          : "机器人设置已保存。",
+      );
+      return true;
+    } catch (e) {
+      setError(e);
+      throw e;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteBot(botId: string) {
+    if (!configuration || busy) return;
+    const cfg = configuration.config;
+    const nextConfig: Config = {
+      ...cfg,
+      bots: cfg.bots.filter((b) => b.id !== botId),
+      bindings: cfg.bindings.filter((b) => b.botId !== botId),
+    };
+    if (!(await saveConfig(nextConfig))) throw new Error("config_save_failed");
+    await reconnectChannel();
+  }
+
+  async function authorizeCandidate(c: any) {
+    if (!configuration) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const current = await api<Configuration>("/api/config");
+      await api("/api/access/authorize", {
+        id: c.id,
+        revision: current.revision,
+      });
+      await reloadConfiguration();
+      await refreshConnection();
+    } catch (e) {
+      setError(e);
+      throw e;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeUser(botId: string, userId: string, name: string) {
+    if (!configuration) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const current = await api<Configuration>("/api/config");
+      await api("/api/access/revoke", {
+        botId,
+        userId,
+        revision: current.revision,
+      });
+      await reloadConfiguration();
+      await refreshConnection();
+    } catch (e) {
+      setError(e);
+      throw e;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setEveryone(botId: string, allowAllUsers: boolean) {
+    const current = await api<Configuration>("/api/config");
+    await api("/api/access/everyone", {
+      botId,
+      allowAllUsers,
+      revision: current.revision,
+    });
+    await reloadConfiguration();
+    await refreshConnection();
+  }
+
+  async function reconnectChannel() {
+    setBusy(true);
+    setError(null);
+    try {
+      await api("/api/connection/connect", {});
+      await reloadConfiguration();
+      await refreshConnection();
+    } catch (e) {
+      setError(e);
+      throw e;
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -301,7 +449,7 @@ function App() {
           <Typography.Paragraph style={{ fontSize: 14 }}>
             在终端工程目录中运行：
           </Typography.Paragraph>
-          <div className="connect-pre">npm start -- console</div>
+          <div className="connect-pre">npm start</div>
           <Typography.Paragraph
             type="secondary"
             size="small"
@@ -354,12 +502,13 @@ function App() {
           footer={
             <div className="sidebar-footer">
               <div className="status-badge-bar">
-                <Badge
-                  dot
-                  type={
-                    state?.health.mode === "offline" ? "warning" : "success"
-                  }
-                >
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <Badge
+                    dot
+                    type={
+                      state?.health.mode === "offline" ? "warning" : "success"
+                    }
+                  />
                   <span
                     style={{
                       fontSize: 12,
@@ -367,11 +516,9 @@ function App() {
                       color: "var(--feishu-text-secondary)",
                     }}
                   >
-                    {state?.health.mode === "offline"
-                      ? "本地模式"
-                      : "Lark 模式"}
+                    {state?.health.mode === "offline" ? "本地模式" : "飞书模式"}
                   </span>
-                </Badge>
+                </div>
                 <Tag size="small" color="green" type="light">
                   已连接
                 </Tag>
@@ -436,6 +583,43 @@ function App() {
               style={{ width: "100%" }}
             />
           )}
+          {view === "robots" &&
+            !connecting &&
+            [
+              ...new Map(
+                registrations.map((j) => [`${j.tenant}:${j.appId || j.id}`, j]),
+              ).values(),
+            ].map((job) => (
+              <Banner
+                key={job.id}
+                type="warning"
+                style={{ width: "100%" }}
+                description={
+                  <Space>
+                    <span>{`${job.name}：接入尚未完成，凭据已保留。${job.permissions?.missing?.length ? `仍缺 ${job.permissions.missing.length} 项权限。` : "请继续确认接入状态。"}`}</span>
+                    <Button
+                      onClick={() => {
+                        setRobot({
+                          id: job.botId,
+                          name: job.name,
+                          agentId: job.agentId,
+                          model: job.model ?? null,
+                          projectId: job.projectId,
+                          tenant: job.tenant,
+                          appId: job.appId || "",
+                          secret: "",
+                        });
+                        setConnecting(true);
+                        setIsAddingBot(false);
+                        setNotice("");
+                      }}
+                    >
+                      继续接入
+                    </Button>
+                  </Space>
+                }
+              />
+            ))}
 
           {!cfg ? (
             <div
@@ -444,488 +628,85 @@ function App() {
               <Spin size="large" />
             </div>
           ) : view === "robots" ? (
-            robot ? (
-              <Card
-                className="robot-editor feishu-card"
-                headerLine={false}
-                title={
-                  <span style={{ fontSize: 16, fontWeight: 600 }}>
-                    {cfg.bots.some((b) => b.id === robot.id)
-                      ? "机器人设置"
-                      : "添加机器人"}
-                  </span>
-                }
-                headerExtraContent={
-                  <Button
-                    theme="borderless"
-                    icon={<IconArrowLeft />}
-                    disabled={busy}
-                    onClick={() => {
-                      setRobot(null);
-                      setConnecting(false);
-                      void reloadConfiguration();
-                    }}
-                  >
-                    返回
-                  </Button>
-                }
-              >
-                {!cfg.bots.some((b) => b.id === robot.id) && (
-                  <div style={{ marginBottom: 20 }}>
-                    <RadioGroup
-                      type="button"
-                      value={scanMode ? "scan" : "manual"}
-                      disabled={scanLocked}
-                      onChange={(e) => setScanMode(e.target.value === "scan")}
-                    >
-                      <Radio value="scan">扫码创建（推荐）</Radio>
-                      <Radio value="manual">接入已有应用</Radio>
-                    </RadioGroup>
-                  </div>
-                )}
-
-                <div
-                  className={
-                    scanLocked ? "registration-details-hidden" : undefined
-                  }
+            connecting && robot ? (
+              <Card style={{ width: "100%" }}>
+                <Button
+                  onClick={() => {
+                    setConnecting(false);
+                    void reloadConfiguration();
+                  }}
                 >
-                  <Row gutter={24}>
-                    <Col xs={24} md={12} style={{ marginBottom: 16 }}>
-                      <div
-                        style={{
-                          marginBottom: 6,
-                          fontWeight: 500,
-                          fontSize: 14,
-                        }}
-                      >
-                        机器人名称 <span style={{ color: "#f93920" }}>*</span>
-                      </div>
-                      <Input
-                        aria-label="机器人名称"
-                        value={robot.name}
-                        maxLength={80}
-                        placeholder="例如：叶玥"
-                        disabled={busy || scanLocked}
-                        onChange={(value) =>
-                          remember({ ...robot, name: value })
-                        }
-                      />
-                    </Col>
-                    <Col xs={24} md={12} style={{ marginBottom: 16 }}>
-                      <div
-                        style={{
-                          marginBottom: 6,
-                          fontWeight: 500,
-                          fontSize: 14,
-                        }}
-                      >
-                        使用哪个 Agent
-                      </div>
-                      <Select
-                        aria-label="使用哪个 Agent"
-                        value={robot.agentId}
-                        style={{ width: "100%" }}
-                        disabled={busy || scanLocked}
-                        optionList={cfg.agents.map((a) => ({
-                          value: a.id,
-                          label: agentLabel(cfg, a.id),
-                        }))}
-                        onChange={(value) =>
-                          remember({
-                            ...robot,
-                            agentId: typeof value === "string" ? value : "",
-                            model: null,
-                          })
-                        }
-                      />
-                    </Col>
-                    <Col xs={24} md={12}>
-                      <RobotModelSelect
-                        key={robot.agentId}
-                        agent={cfg.agents.find((a) => a.id === robot.agentId)}
-                        value={robot.model ?? null}
-                        disabled={busy || scanLocked}
-                        onChange={(model) => remember({ ...robot, model })}
-                      />
-                    </Col>
-                    <Col xs={24} md={12} style={{ marginBottom: 16 }}>
-                      <div
-                        style={{
-                          marginBottom: 6,
-                          fontWeight: 500,
-                          fontSize: 14,
-                        }}
-                      >
-                        工作区
-                      </div>
-                      <WorkspaceSelect
-                        projects={cfg.projects}
-                        value={robot.projectId}
-                        disabled={busy || scanLocked}
-                        onChange={(value) =>
-                          remember({ ...robot, projectId: value })
-                        }
-                      />
-                      <Button
-                        theme="borderless"
-                        size="small"
-                        disabled={busy || scanLocked}
-                        onClick={() => setView("projects")}
-                        style={{ marginTop: 4, padding: 0 }}
-                      >
-                        管理 / 添加工作区
-                      </Button>
-                    </Col>
-                    <Col xs={24} md={12} style={{ marginBottom: 16 }}>
-                      <div
-                        style={{
-                          marginBottom: 6,
-                          fontWeight: 500,
-                          fontSize: 14,
-                        }}
-                      >
-                        平台
-                      </div>
-                      <Select
-                        aria-label="平台"
-                        value={robot.tenant}
-                        style={{ width: "100%" }}
-                        disabled={busy || scanLocked}
-                        optionList={[
-                          { value: "feishu", label: "飞书" },
-                          { value: "lark", label: "Lark (国际版)" },
-                        ]}
-                        onChange={(value) =>
-                          remember({
-                            ...robot,
-                            tenant: (value as "feishu" | "lark") || "feishu",
-                          })
-                        }
-                      />
-                    </Col>
-                  </Row>
-
-                  {!connecting &&
-                    (!scanMode || cfg.bots.some((b) => b.id === robot.id)) && (
-                      <div
-                        style={{
-                          marginTop: 12,
-                          borderTop: "1px solid var(--feishu-border-light)",
-                          paddingTop: 16,
-                        }}
-                      >
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 8,
-                            marginBottom: 16,
-                          }}
-                        >
-                          <span style={{ fontWeight: 600 }}>连接飞书应用</span>
-                          <span>·</span>
-                          <a
-                            href={
-                              robot.tenant === "lark"
-                                ? "https://open.larksuite.com/app"
-                                : "https://open.feishu.cn/app"
-                            }
-                            target="_blank"
-                            rel="noreferrer"
-                            style={{
-                              color: "var(--feishu-primary)",
-                              textDecoration: "none",
-                              fontSize: 13,
-                            }}
-                          >
-                            打开{robot.tenant === "lark" ? " Lark " : "飞书"}
-                            开放平台 ↗
-                          </a>
-                        </div>
-                        <div style={{ marginBottom: 16 }}>
-                          <div
-                            style={{
-                              marginBottom: 6,
-                              fontWeight: 500,
-                              fontSize: 14,
-                            }}
-                          >
-                            App ID <span style={{ color: "#f93920" }}>*</span>
-                          </div>
-                          <Input
-                            aria-label="App ID"
-                            value={robot.appId}
-                            placeholder="cli_…"
-                            disabled={busy}
-                            onChange={(value) =>
-                              remember({ ...robot, appId: value })
-                            }
-                          />
-                        </div>
-                        <div style={{ marginBottom: 16 }}>
-                          <div
-                            style={{
-                              marginBottom: 6,
-                              fontWeight: 500,
-                              fontSize: 14,
-                            }}
-                          >
-                            App Secret{" "}
-                            {!cfg.bots.some((b) => b.id === robot.id) && (
-                              <span style={{ color: "#f93920" }}>*</span>
-                            )}
-                          </div>
-                          <Input
-                            mode="password"
-                            aria-label="App Secret"
-                            autoComplete="new-password"
-                            value={robot.secret}
-                            placeholder={
-                              cfg.bots.some((b) => b.id === robot.id)
-                                ? "已保存在本机，更换时再输入"
-                                : "粘贴应用密钥"
-                            }
-                            disabled={busy}
-                            onChange={(value) =>
-                              setRobot({ ...robot, secret: value })
-                            }
-                          />
-                          <Typography.Text
-                            type="tertiary"
-                            size="small"
-                            style={{ display: "block", marginTop: 4 }}
-                          >
-                            仅保存在本机；等待权限审批时也会安全保留，方便继续接入。
-                          </Typography.Text>
-                        </div>
-                        <div className="form-actions">
-                          <Typography.Text type="tertiary" size="small">
-                            自动检查并申请本项目缺少的权限。不会向群或联系人发送测试消息。
-                          </Typography.Text>
-                          <Button
-                            theme="solid"
-                            type="primary"
-                            loading={busy}
-                            disabled={
-                              !robot.name.trim() ||
-                              !robot.appId.trim() ||
-                              (!cfg.bots.some((b) => b.id === robot.id) &&
-                                !robot.secret)
-                            }
-                            onClick={() => void saveRobot()}
-                          >
-                            {cfg.bots.some((b) => b.id === robot.id)
-                              ? "保存设置"
-                              : "连接并保存"}
-                          </Button>
-                        </div>
-                      </div>
-                    )}
-                </div>
-
-                {(connecting ||
-                  (scanMode && !cfg.bots.some((b) => b.id === robot.id))) && (
-                  <RegistrationPanel
-                    input={{
-                      id: robot.id,
-                      name: robot.name,
-                      agentId: robot.agentId,
-                      model: robot.model,
-                      projectId: robot.projectId,
-                      tenant: robot.tenant,
-                      revision: configuration!.revision,
-                    }}
-                    onLock={setScanLocked}
-                    onSaved={(result) => {
-                      setConfiguration(result);
-                      setRobot(null);
-                      setScanLocked(false);
-                      setConnecting(false);
-                      sessionStorage.removeItem(draftKey);
-                      setNotice(
-                        "机器人已保存。点击“应用设置并上线”，再授权使用会话。",
-                      );
-                    }}
-                  />
-                )}
-              </Card>
-            ) : (
-              <>
-                <ConnectionPanel
-                  config={cfg}
-                  changed={async () => {
+                  返回机器人列表
+                </Button>
+                <RegistrationPanel
+                  key={robot.id}
+                  input={{ ...robot, revision: configuration.revision }}
+                  onLock={setScanLocked}
+                  onSaved={async () => {
                     await reloadConfiguration();
-                    await refresh();
+                    setConnecting(false);
+                    setRobot(null);
+                    setSelectedBotId(robot.id);
+                    setNotice("机器人已保存。点击“应用设置并上线”连接飞书。");
                   }}
                 />
-
-                {!cfg.bots.length ? (
-                  <Card
-                    className="feishu-card"
-                    style={{ textAlign: "center", padding: "40px 20px" }}
-                  >
-                    <Empty
-                      title="还没有配置机器人"
-                      description="扫码创建飞书机器人，或接入已有的飞书开放平台应用。"
-                    />
-                    <Button
-                      theme="solid"
-                      type="primary"
-                      icon={<IconPlus />}
-                      style={{ marginTop: 20 }}
-                      onClick={() => edit()}
-                    >
-                      添加机器人
-                    </Button>
-                  </Card>
-                ) : (
-                  <>
-                    <div className="robots-grid">
-                      {cfg.bots.map((bot) => (
-                        <div key={bot.id} className="robot-card">
-                          <div className="robot-card-head">
-                            <div className="robot-card-title">
-                              <div
-                                style={{
-                                  width: 32,
-                                  height: 32,
-                                  borderRadius: 8,
-                                  background: "var(--feishu-primary-light)",
-                                  color: "var(--feishu-primary)",
-                                  display: "grid",
-                                  placeItems: "center",
-                                }}
-                              >
-                                <RobotIcon size={18} />
-                              </div>
-                              <span>{bot.name || bot.id}</span>
-                            </div>
-                            <Button
-                              theme="borderless"
-                              size="small"
-                              onClick={() => edit(bot)}
-                            >
-                              设置
-                            </Button>
-                          </div>
-
-                          <div className="robot-meta-row">
-                            <div className="robot-meta-item">
-                              <span className="robot-meta-label">运行时：</span>
-                              <Tag color="blue" type="light" size="small">
-                                {agentLabel(cfg, bot.agentId)}
-                              </Tag>
-                            </div>
-                            <div className="robot-meta-item">
-                              <span className="robot-meta-label">模型：</span>
-                              <span>
-                                {bot.model ||
-                                  cfg.agents.find((a) => a.id === bot.agentId)
-                                    ?.model ||
-                                  "跟随 CLI 默认"}
-                              </span>
-                            </div>
-                            <div className="robot-meta-item">
-                              <span className="robot-meta-label">工作区：</span>
-                              <span style={{ wordBreak: "break-all" }}>
-                                {workspaceName(
-                                  cfg.projects.find(
-                                    (p) => p.id === bot.projectId,
-                                  ),
-                                )}
-                              </span>
-                            </div>
-                            <div className="robot-meta-item">
-                              <span className="robot-meta-label">会话：</span>
-                              <span
-                                style={{
-                                  color: cfg.bindings.some(
-                                    (b) => b.botId === bot.id,
-                                  )
-                                    ? "var(--semi-color-success)"
-                                    : "var(--feishu-text-tertiary)",
-                                }}
-                              >
-                                {cfg.bindings.some((b) => b.botId === bot.id)
-                                  ? "已配置使用会话"
-                                  : "等待会话授权"}
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <Space wrap>
-                      <Button
-                        theme="solid"
-                        type="primary"
-                        icon={<IconPlus />}
-                        onClick={() => edit()}
-                      >
-                        添加机器人
-                      </Button>
-                      {registrations
-                        .filter(
-                          (j) => j.status === "pending" || j.status === "ready",
-                        )
-                        .map((j) => (
-                          <Button
-                            key={j.id}
-                            onClick={() => {
-                              setScanMode(j.intent !== "connect");
-                              setConnecting(true);
-                              remember({
-                                id: j.botId,
-                                name: j.name,
-                                agentId: j.agentId,
-                                model: j.model,
-                                projectId: j.projectId,
-                                tenant: j.tenant,
-                                appId: j.appId || "",
-                                secret: "",
-                              });
-                            }}
-                          >
-                            继续连接：{j.name}
-                          </Button>
-                        ))}
-                      {stored<RobotDraft>(draftKey) && (
-                        <Button
-                          theme="borderless"
-                          onClick={() =>
-                            setRobot({
-                              ...stored<RobotDraft>(draftKey)!,
-                              secret: "",
-                            })
-                          }
-                        >
-                          继续未保存的草稿
-                        </Button>
-                      )}
-                    </Space>
-                  </>
-                )}
-
-                {configuration?.pendingRestart && (
-                  <Banner
-                    type="info"
-                    style={{ width: "100%" }}
-                    description="设置已保存，点击“应用设置并上线”使其生效。"
-                  />
-                )}
-                <div style={{ marginTop: 8 }}>
-                  <Button
-                    size="small"
-                    theme="borderless"
-                    onClick={() =>
-                      void reloadConfiguration().catch((e) => setError(e))
-                    }
-                  >
-                    重新读取配置
-                  </Button>
-                </div>
-              </>
+              </Card>
+            ) : isAddingBot ? (
+              <AddBotView
+                config={cfg}
+                revision={configuration.revision}
+                onBack={() => setIsAddingBot(false)}
+                onSaved={async (newBotId) => {
+                  await reloadConfiguration();
+                  await refreshConnection();
+                  setIsAddingBot(false);
+                  setSelectedBotId(newBotId);
+                  setNotice("机器人已成功添加并保存。");
+                }}
+                onSaveManual={saveBotDraft}
+              />
+            ) : selectedBotId &&
+              cfg.bots.some((b) => b.id === selectedBotId) ? (
+              <BotDetail
+                bot={cfg.bots.find((b) => b.id === selectedBotId)!}
+                config={cfg}
+                connectionState={connectionState}
+                onBack={() => {
+                  setSelectedBotId(null);
+                  setInitialBotTab(undefined);
+                }}
+                onSaveBot={async (draft) => {
+                  const saved = await saveBotDraft(draft);
+                  await reloadConfiguration();
+                  await refreshConnection();
+                  return saved;
+                }}
+                onDeleteBot={async (botId) => {
+                  await deleteBot(botId);
+                  setSelectedBotId(null);
+                  setNotice("机器人已成功移除。");
+                }}
+                onAuthorizeCandidate={authorizeCandidate}
+                onRevokeUser={revokeUser}
+                onSetEveryone={setEveryone}
+                onReconnect={reconnectChannel}
+                pendingRestart={configuration.pendingRestart}
+                onApplyRestart={async () => {
+                  await reconnectChannel();
+                  await reloadConfiguration();
+                }}
+                initialTab={initialBotTab}
+              />
+            ) : (
+              <BotList
+                config={cfg}
+                connectionState={connectionState}
+                onSelectBot={(id, tab) => {
+                  setSelectedBotId(id);
+                  setInitialBotTab(tab);
+                }}
+                onAddBot={() => setIsAddingBot(true)}
+              />
             )
           ) : view === "projects" ? (
             <WorkspaceSettings config={cfg} busy={busy} onSave={saveConfig} />

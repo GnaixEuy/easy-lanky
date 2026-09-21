@@ -90,6 +90,52 @@ function setup(t: any) {
     },
   };
 }
+test("one chat history failure does not starve other chats or advance the failed cursor", async (t) => {
+  const x = setup(t);
+  x.seed();
+  x.host.config.bindings.push({
+    ...x.host.config.bindings[0],
+    id: "second",
+    chatId: "other-chat",
+  });
+  const before = (
+    x.store.db
+      .prepare("SELECT value FROM meta WHERE key=?")
+      .get("message-recovery:scope") as any
+  ).value;
+  x.store.db
+    .prepare("INSERT INTO meta VALUES (?,?)")
+    .run("message-recovery:second", before);
+  const logs: object[] = [];
+  const recovery = new MessageRecovery(
+    x.host,
+    () => true,
+    async (binding) => {
+      if (binding.id === "scope") throw new Error("private-provider-error");
+      return { items: [{ ...x.item, chat_id: "other-chat" }] };
+    },
+    (e) => x.host.receive(e),
+    (e) => logs.push(e),
+  );
+  await recovery.poll();
+  assert.equal(x.store.runs().length, 1);
+  assert.equal(x.store.runs()[0].bindingId, "second");
+  assert.equal(
+    (
+      x.store.db
+        .prepare("SELECT value FROM meta WHERE key=?")
+        .get("message-recovery:scope") as any
+    ).value,
+    before,
+  );
+  assert.deepEqual(logs[0], {
+    kind: "message_recovery_failed",
+    botId: "b",
+    bindingId: "scope",
+  });
+  assert.ok(!JSON.stringify(logs).includes("private-provider-error"));
+});
+
 test("first enablement skips old history; authorized missed message executes once across REST and socket", async (t) => {
   const x = setup(t);
   await x.recovery.poll();
@@ -203,4 +249,20 @@ test("authorized history preserves verified user mentions for recipient resoluti
   assert.deepEqual(run.mentionedContacts, [
     { openId: "ou_target", name: "宇翔" },
   ]);
+});
+
+test("missed private image messages use the same image context as live messages", async (t) => {
+  const x = setup(t);
+  x.seed();
+  x.setPage({
+    items: [
+      {
+        ...x.item,
+        msg_type: "image",
+        body: { content: JSON.stringify({ image_key: "img_received" }) },
+      },
+    ],
+  });
+  await x.recovery.poll();
+  assert.deepEqual(x.store.runs()[0].imageKeys, ["img_received"]);
 });

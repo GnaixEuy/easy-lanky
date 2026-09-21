@@ -1,3 +1,4 @@
+import { isUserAllowed } from "./access.js";
 import { randomUUID } from "node:crypto";
 import type { Config, Binding, Bot } from "./config.js";
 import { digest, type Run, type Delivery } from "./contracts.js";
@@ -33,7 +34,7 @@ export class ConversationStore {
     user: string,
   ): ConversationRef {
     const project = config.projects.find((p) => p.id === binding.projectId);
-    if (!project || !binding.allowedUsers.includes(user))
+    if (!project || !isUserAllowed(bot, user, binding))
       throw new Error("conversation_scope_rejected");
     const scope = digest([
       bot.id,
@@ -204,7 +205,7 @@ export function importPrivateHistory(
 ) {
   if (
     binding.threadId !== null ||
-    !binding.allowedUsers.includes(user) ||
+    !isUserAllowed(bot, user, binding) ||
     !binding.allowSend
   )
     throw new Error("conversation_scope_rejected");

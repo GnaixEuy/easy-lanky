@@ -11,7 +11,7 @@ import { ConnectionService } from "../src/connection.js";
 import type { Inbound } from "../src/contracts.js";
 function setup(t: any) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "lark-connection-"));
-  const config = configSchema.parse({
+  let config = configSchema.parse({
     version: 1,
     stateDir: dir,
     agents: [{ id: "chatgpt", runtime: "codex", executable: "codex" }],
@@ -34,6 +34,7 @@ function setup(t: any) {
   });
   const file = path.join(dir, "config.local.json");
   writeFileSync(file, JSON.stringify(config));
+  config = loadConfig(file);
   const store = new Store(dir);
   let sends = 0,
     executes = 0,
@@ -104,7 +105,7 @@ test("offline cannot receive; directed human needs explicit authorization; next 
   assert.equal(x.connection.receive(x.event).status, "connection_not_ready");
   await x.connection.connect();
   x.adapter();
-  assert.equal(x.connection.receive(x.event).status, "unbound_target");
+  assert.equal(x.connection.receive(x.event).status, "user_not_authorized");
   assert.equal(x.sends(), 0);
   assert.equal(x.store.runs().length, 0);
   const candidate = x.connection.snapshot().candidates[0];
@@ -136,7 +137,7 @@ test("offline cannot receive; directed human needs explicit authorization; next 
       nativeId: "m4",
       threadId: "other-topic",
     }).status,
-    "unbound_target",
+    "accepted",
   );
 });
 test("untrusted, agent, broadcast and undirected group messages cannot propose bindings", async (t) => {
@@ -203,13 +204,46 @@ test("applying configuration refuses active work and concurrent writes during co
   await assert.rejects(x.connection.connect(), /connection_busy/);
   release();
   await pending;
-  x.host.submitLocal({
+  const queued = x.host.submitLocal({
     requestId: "request",
     agentId: "chatgpt",
     projectId: "project",
     prompt: "test",
     allowWrites: false,
   });
+  x.host.active.set(queued.runId!, new AbortController());
+  await assert.rejects(x.connection.connect(), /config_change_requires_review/);
+  x.host.active.clear();
+});
+
+test("unchanged configuration reconnects with recovered work; changed configuration stays protected", async (t) => {
+  const x = setup(t);
+  x.host.submitLocal({
+    requestId: "recovered",
+    agentId: "chatgpt",
+    projectId: "project",
+    prompt: "pending work",
+    allowWrites: false,
+  });
+  x.store.enqueue({
+    id: "pending-reply",
+    botId: "bot",
+    chatId: "chat",
+    threadId: null,
+    replyTo: "m1",
+    text: "reply",
+  });
+  for (const state of ["pending", "unknown", "blocked"]) {
+    x.store.deliveryState("pending-reply", state);
+    await x.connection.connect();
+    assert.equal(x.connection.offline, false);
+    assert.equal(x.store.deliveries()[0].state, state);
+    assert.equal(x.sends(), 0);
+  }
+  writeFileSync(
+    x.file,
+    JSON.stringify({ ...x.config, maxQueue: x.config.maxQueue + 1 }),
+  );
   await assert.rejects(x.connection.connect(), /config_change_requires_review/);
 });
 test("connection HTTP endpoints enforce authentication and origin before connecting or authorizing", async (t) => {
@@ -301,6 +335,29 @@ test("saved settings apply without process restart and retain the persisted fing
   );
 });
 
+test("removing the last bot applies empty configuration and disconnects the old identity", async (t) => {
+  const x = setup(t);
+  await x.connection.connect();
+  let disconnected = false;
+  x.transport.disconnect = async () => {
+    disconnected = true;
+  };
+  x.transport.connect = async () => {
+    throw new Error("empty_config_must_not_connect");
+  };
+  const current = x.manager.snapshot();
+  x.manager.save(
+    { ...current.config, bots: [], bindings: [] },
+    current.revision,
+  );
+  await x.connection.connect();
+  assert.equal(disconnected, true);
+  assert.equal(x.connection.offline, true);
+  assert.equal(x.config.bots.length, 0);
+  assert.equal(x.manager.pendingRestart, false);
+  assert.equal(x.connection.receive(x.event).status, "connection_not_ready");
+});
+
 test("revoking a person persists and takes effect immediately without granting anyone else access", async (t) => {
   const x = setup(t);
   await x.connection.connect();
@@ -350,4 +407,110 @@ test("revoking a person persists and takes effect immediately without granting a
   x.connection.authorize(candidate.id, x.manager.snapshot().revision);
   assert.ok(x.config.bindings[0].allowedUsers.includes("user"));
   assert.equal(x.store.runs().length, 0);
+});
+
+test("person authorization spans chats; everyone mode bypasses only the human whitelist and survives restart", async (t) => {
+  const x = setup(t);
+  await x.connection.connect();
+  x.adapter();
+  x.connection.receive(x.event);
+  x.connection.receive({
+    ...x.event,
+    nativeId: "request-in-group",
+    chatId: "group",
+    chatType: "group",
+    mentions: ["self"],
+  });
+  assert.equal(x.connection.snapshot().candidates.length, 1);
+  x.connection.authorize(
+    x.connection.snapshot().candidates[0].id,
+    x.manager.snapshot().revision,
+  );
+  const group: Inbound = {
+    ...x.event,
+    nativeId: "authorized-group",
+    chatId: "group",
+    threadId: "topic",
+    chatType: "group",
+    mentions: ["self"],
+  };
+  assert.equal(x.connection.receive(group).status, "accepted");
+  const drain = async () => {
+    await x.host.tick();
+    while (x.host.active.size) await new Promise((r) => setTimeout(r, 5));
+    await x.host.tick();
+  };
+  await drain();
+  const groupRun = x.store.runs()[0];
+  assert.equal(x.host.binding(groupRun.bindingId).chatId, "group");
+  assert.equal(x.manager.pendingRestart, false);
+  assert.equal(
+    x.connection.receive({ ...group, nativeId: "outsider", senderId: "other" })
+      .status,
+    "user_not_authorized",
+  );
+  assert.throws(
+    () => x.connection.setEveryone("bot", true, "stale"),
+    /config_revision_conflict/,
+  );
+  x.connection.setEveryone("bot", true, x.manager.snapshot().revision);
+  assert.equal(x.connection.snapshot().candidates.length, 0);
+  assert.equal(
+    x.connection.receive({ ...group, nativeId: "everyone", senderId: "other" })
+      .status,
+    "accepted",
+  );
+  await drain();
+  assert.notEqual(
+    x.store.runs()[0].conversation?.scope,
+    x.store.runs()[1].conversation?.scope,
+  );
+  for (const override of [
+    { tenantKey: "foreign" },
+    { senderType: "agent" as const },
+    { senderType: "unknown" as const },
+    { mentions: [] },
+    { mentionAll: true },
+    { senderId: "self" },
+  ])
+    assert.notEqual(
+      x.connection.receive({
+        ...group,
+        ...override,
+        nativeId: JSON.stringify(override),
+      }).status,
+      "accepted",
+    );
+  const restored = new Host(
+    loadConfig(x.file),
+    x.store,
+    new Map(),
+    x.transport,
+  );
+  assert.equal(restored.binding(groupRun.bindingId).threadId, "topic");
+  assert.equal(
+    restored.receive({
+      ...group,
+      senderId: "another",
+      nativeId: "after-restart",
+      text: "",
+    }).status,
+    "empty",
+  );
+  x.connection.setEveryone("bot", false, x.manager.snapshot().revision);
+  assert.equal(
+    x.connection.receive({ ...group, nativeId: "disabled", senderId: "other" })
+      .status,
+    "user_not_authorized",
+  );
+  x.connection.revoke("bot", "user", x.manager.snapshot().revision);
+  assert.equal(
+    x.connection.receive({ ...group, nativeId: "revoked-group" }).status,
+    "user_not_authorized",
+  );
+  assert.equal(
+    x.connection.receive({ ...x.event, nativeId: "revoked-private" }).status,
+    "user_not_authorized",
+  );
+  assert.deepEqual(loadConfig(x.file).bots[0].allowedUsers, []);
 });
