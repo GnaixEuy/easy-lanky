@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { PermissionService } from "../src/permissions.js";
 import { requiredTenantScopes } from "../src/permissions-manifest.js";
+import { registrationLink } from "../src/registration-link.js";
+import { gunzipSync } from "node:zlib";
 function fixture(t: any) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "easy-larky-scopes-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -50,6 +52,71 @@ function fixture(t: any) {
     applied: () => applied,
   };
 }
+
+test("current contact and meeting grants unblock onboarding without requiring legacy scopes", async (t) => {
+  const f = fixture(t);
+  const scopes = [
+    ...requiredTenantScopes.filter(
+      (scope) =>
+        !["contact:contact:readonly_as_app", "vc:meeting:readonly"].includes(
+          scope,
+        ),
+    ),
+    "vc:meeting.meetingevent:read",
+  ];
+  const rows = scopes.map((scope_name) => ({
+    scope_name,
+    grant_status: 1,
+    scope_type: "tenant",
+  }));
+  f.setRows(rows);
+  const ready = await f
+    .service()
+    .ensure("feishu", "cli_fixture", "secret", false);
+  assert.equal(ready.status, "granted");
+  assert.deepEqual(ready.missing, []);
+  const url = new URL(registrationLink("https://open.feishu.cn/", "test"));
+  const addons = JSON.parse(
+    gunzipSync(
+      Buffer.from(url.searchParams.get("addons")!, "base64url"),
+    ).toString(),
+  );
+  assert.ok(addons.scopes.tenant.includes("vc:meeting.meetingevent:read"));
+  assert.ok(!addons.scopes.tenant.includes("vc:meeting:readonly"));
+  assert.ok(!addons.scopes.tenant.includes("contact:contact:readonly_as_app"));
+  f.setRows(
+    rows.map((row) =>
+      row.scope_name === "vc:meeting.meetingevent:read"
+        ? { ...row, scope_type: "user" }
+        : row,
+    ),
+  );
+  assert.deepEqual(
+    (await f.service().ensure("feishu", "cli_fixture", "secret", false))
+      .missing,
+    ["vc:meeting.meetingevent:read"],
+  );
+  f.setRows(
+    rows.map((row) =>
+      row.scope_name === "vc:meeting.meetingevent:read"
+        ? { ...row, scope_name: "vc:meeting:readonly" }
+        : row,
+    ),
+  );
+  assert.equal(
+    (await f.service().ensure("feishu", "cli_fixture", "secret", false)).status,
+    "granted",
+  );
+  f.setRows(
+    rows.filter((row) => row.scope_name !== "contact:contact.base:readonly"),
+  );
+  assert.deepEqual(
+    (await f.service().ensure("feishu", "cli_fixture", "secret", false))
+      .missing,
+    ["contact:contact.base:readonly"],
+  );
+  assert.equal(f.applied(), 0);
+});
 
 test("only actual tenant grants count; undeclared scopes require configuration before any admin application", async (t) => {
   const f = fixture(t);

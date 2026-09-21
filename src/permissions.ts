@@ -109,6 +109,9 @@ export class PermissionService {
       // The old broader group/chat grants also satisfy the corresponding read capability.
       if (granted.has("im:chat:readonly") || granted.has("im:chat"))
         granted.add("im:chat:read");
+      // Official vc.meeting.get accepts either scope; request the current one for new apps.
+      if (granted.has("vc:meeting:readonly"))
+        granted.add("vc:meeting.meetingevent:read");
       const declared = new Set(tenantRows.map((r) => r.scope_name));
       const missing = requiredTenantScopes.filter((name) => !granted.has(name));
       const undeclared = missing.filter((name) => !declared.has(name));

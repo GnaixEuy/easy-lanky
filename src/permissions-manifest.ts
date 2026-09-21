@@ -1,11 +1,6 @@
 // Managed bot tools: messaging plus core document, table, calendar and task scopes.
 export const permissionManifest = [
   {
-    scope: "contact:contact:readonly_as_app",
-    name: "以应用身份读取通讯录",
-    purpose: "按应用授权范围读取用户与部门列表",
-  },
-  {
     scope: "contact:user.base:readonly",
     name: "获取用户基本信息",
     purpose: "读取收件人姓名，避免只拿到用户 ID 而无法按姓名查找",
@@ -77,7 +72,7 @@ export const permissionManifest = [
     purpose: "为官方 CLI 的妙记能力申请较完整的应用权限",
   },
   {
-    scope: "vc:meeting:readonly",
+    scope: "vc:meeting.meetingevent:read",
     name: "读取会议信息",
     purpose: "查询会议详情、关联纪要和妙记",
   },

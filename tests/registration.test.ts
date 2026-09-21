@@ -111,6 +111,132 @@ const success = {
   client_secret: "private-app-secret",
   user_info: { tenant_brand: "feishu" },
 };
+test("completed and deleted robots retire stale attempts without losing unfinished onboarding", async (t) => {
+  const f = setup(t);
+  const missing: PermissionStatus = {
+    status: "configuration_required",
+    missing: [requiredTenantScopes[0]],
+    undeclared: [requiredTenantScopes[0]],
+    checkedAt: 0,
+  };
+  f.setPermissions(missing);
+  f.responses.push(begin, begin, begin);
+  const old = await f.service.connect({
+    ...f.input,
+    id: "old-attempt",
+    appId: "cli_existing",
+    secret: "secret",
+  });
+  const unrelated = await f.service.connect({
+    ...f.input,
+    id: "unfinished",
+    appId: "cli_other",
+    secret: "secret",
+  });
+  const otherBrand = await f.service.connect({
+    ...f.input,
+    id: "other-brand",
+    tenant: "lark",
+    appId: "cli_existing",
+    secret: "secret",
+  });
+  f.setPermissions({
+    status: "granted",
+    missing: [],
+    undeclared: [],
+    checkedAt: 0,
+  });
+  await f.service.connect({
+    ...f.input,
+    id: "saved-bot",
+    appId: "cli_existing",
+    secret: "secret",
+  });
+  assert.deepEqual(
+    (await f.service.list()).map((j) => j.id),
+    [unrelated.registration.id, otherBrand.registration.id],
+  );
+  assert.equal(
+    (await f.service.status(old.registration.id)).status,
+    "cancelled",
+  );
+  await assert.rejects(
+    f.service.finish(old.registration.id),
+    /registration_not_ready/,
+  );
+
+  f.setPermissions(missing);
+  f.responses.push(begin);
+  const editing = await f.service.connect({
+    ...f.input,
+    id: "saved-bot",
+    appId: "cli_existing",
+    secret: "secret",
+    revision: f.manager.snapshot().revision,
+  });
+  assert.ok(
+    (await f.service.list()).some((j) => j.id === editing.registration.id),
+  );
+  const current = f.manager.snapshot();
+  f.manager.save({ ...current.config, bots: [] }, current.revision);
+  const restored = new RegistrationService(
+    f.manager,
+    f.request,
+    f.clock,
+    f.discover,
+    f.permissions,
+  );
+  assert.deepEqual(
+    (await restored.list()).map((j) => j.id),
+    [unrelated.registration.id, otherBrand.registration.id],
+  );
+  assert.equal(
+    (await restored.status(editing.registration.id)).status,
+    "cancelled",
+  );
+  assert.ok(
+    readFileSync(f.file + ".registrations.local.json", "utf8").includes(
+      "cli_other",
+    ),
+  );
+});
+
+test("existing app can finish after developer-console grants without rescanning or recreating", async (t) => {
+  const f = setup(t);
+  f.setPermissions({
+    status: "configuration_required",
+    missing: [requiredTenantScopes[0]],
+    undeclared: [requiredTenantScopes[0]],
+    checkedAt: 0,
+  });
+  f.responses.push(begin);
+  const pending = await f.service.connect({
+    ...f.input,
+    appId: "cli_existing",
+    secret: "secret",
+  });
+  assert.equal(pending.registration.status, "pending");
+  assert.equal(pending.configuration, undefined);
+  const blocked = await f.service.finish(
+    pending.registration.id,
+    f.manager.snapshot().revision,
+  );
+  assert.equal(blocked.configuration, undefined);
+  assert.equal(f.manager.snapshot().config.bots.length, 0);
+  f.setPermissions({
+    status: "granted",
+    missing: [],
+    undeclared: [],
+    checkedAt: f.clock(),
+  });
+  const saved = await f.service.finish(
+    pending.registration.id,
+    f.manager.snapshot().revision,
+  );
+  assert.equal(saved.registration.status, "saved");
+  assert.equal(saved.configuration!.config.bots[0].appId, "cli_existing");
+  assert.equal(f.calls.length, 1);
+});
 test("QR begin is idempotent, throttles polls, and never exposes device codes or credentials", async (t) => {
   const f = setup(t);
   f.responses.push(

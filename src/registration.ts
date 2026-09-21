@@ -101,6 +101,7 @@ export class RegistrationService {
     }
   }
   private get(id: string) {
+    this.retireCompletedRegistrations();
     const job = this.jobs.get(id);
     if (!job) throw new Error("registration_not_found");
     this.expire(job);
@@ -130,7 +131,44 @@ export class RegistrationService {
       appId: job.credentials?.appId ?? job.expectedAppId,
     };
   }
+  private retireCompletedRegistrations() {
+    const jobs = [...this.jobs.values()];
+    const bots = this.configuration.snapshot().config.bots;
+    let changed = false;
+    for (const [index, job] of jobs.entries()) {
+      if (!["pending", "ready"].includes(job.status)) continue;
+      const appId = job.credentials?.appId ?? job.expectedAppId;
+      const tenant = job.credentials?.brand ?? job.input.tenant;
+      const superseded =
+        appId &&
+        jobs
+          .slice(index + 1)
+          .some(
+            (other) =>
+              other.status === "saved" &&
+              (other.expectedAppId ??
+                other.credentials?.appId ??
+                bots.find((bot) => bot.id === other.input.id)?.appId) ===
+                appId &&
+              other.input.tenant === tenant,
+          );
+      const deleted =
+        !bots.some((bot) => bot.id === job.input.id) &&
+        jobs.some(
+          (other) =>
+            other.status === "saved" && other.input.id === job.input.id,
+        );
+      if (!superseded && !deleted) continue;
+      // Keep the recovery record, but never offer an obsolete attempt as pending again.
+      job.status = "cancelled";
+      delete job.deviceCode;
+      delete job.url;
+      changed = true;
+    }
+    if (changed) this.persist();
+  }
   async list() {
+    this.retireCompletedRegistrations();
     for (const job of this.jobs.values()) this.expire(job);
     return Promise.all(
       [...this.jobs.values()]
@@ -163,6 +201,7 @@ export class RegistrationService {
     }
   }
   async begin(raw: unknown) {
+    this.retireCompletedRegistrations();
     const input = registrationInput.parse(raw);
     if (!path.basename(this.configuration.file).includes(".local."))
       throw new Error("local_config_file_required");
@@ -267,6 +306,7 @@ export class RegistrationService {
     delete job.error;
   }
   async connect(raw: unknown) {
+    this.retireCompletedRegistrations();
     const input = robotInput.parse(raw);
     const current = this.configuration.snapshot();
     if (!path.basename(this.configuration.file).includes(".local."))
@@ -467,14 +507,18 @@ export class RegistrationService {
         registration: await this.view(job),
         configuration: this.configuration.snapshot(),
       };
-    if (job.status !== "ready" || !job.credentials)
+    if (!["pending", "ready"].includes(job.status) || !job.credentials)
       throw new Error("registration_not_ready");
     if (this.busy.has(id)) throw new Error("registration_busy");
     this.busy.add(id);
     try {
       if (revision) job.input.revision = revision;
       delete job.error;
-      if (!job.permissions || this.now() - job.permissions.checkedAt >= 10000) {
+      if (
+        revision ||
+        !job.permissions ||
+        this.now() - job.permissions.checkedAt >= 10000
+      ) {
         job.permissions = await this.permissions.ensure(
           job.credentials.brand,
           job.credentials.appId,
@@ -509,6 +553,7 @@ export class RegistrationService {
         job.intent === "create" ? "personal-agent" : undefined,
       );
       job.status = "saved";
+      job.expectedAppId = job.credentials.appId;
       delete job.credentials;
       delete job.error;
       this.persist();
