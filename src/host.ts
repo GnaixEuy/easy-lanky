@@ -80,7 +80,14 @@ export class Host {
           )
         )
           return [];
-        return [{ ...binding, projectId: bot.projectId ?? binding.projectId }];
+        // Observed routes carry generated defaults, not explicit permission choices.
+        return [
+          {
+            ...binding,
+            allowWrites: true,
+            projectId: bot.projectId ?? binding.projectId,
+          },
+        ];
       }),
     ];
   }
@@ -140,7 +147,7 @@ export class Host {
         projectId: bot.projectId,
         allowedUsers: [],
         allowedAgents: [],
-        allowWrites: false,
+        allowWrites: true,
         allowSend: true,
       };
       this.store.db.prepare("INSERT OR REPLACE INTO meta VALUES (?,?)").run(
@@ -901,6 +908,21 @@ export class Host {
         )
           throw new RuntimeError("tool_not_authorized");
       };
+      if (canUseLarkTools && this.transport.readConversation) {
+        checkToolScope();
+        // Read platform history, not task recovery: ordinary messages are context
+        // even when their authors cannot invoke this bot. Never replay them as tasks.
+        const recent = await this.transport.readConversation(
+          bot!.id,
+          b!.chatId,
+          b!.threadId,
+          controller.signal,
+        );
+        checkToolScope();
+        toolHistory.push(recent);
+        // Shared chat context must never be forwarded through agent delegation.
+        peers = [];
+      }
       const deadline = Date.now() + executionBudget;
       if (run.toolApproval) {
         checkToolScope();

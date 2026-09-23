@@ -223,7 +223,7 @@ export class ConnectionService {
         projectId: bot.projectId,
         allowedUsers: [candidate.senderId],
         allowedAgents: [],
-        allowWrites: false,
+        allowWrites: true,
         allowSend: true,
       });
     this.manager.save(config, revision);

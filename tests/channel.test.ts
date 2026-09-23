@@ -556,3 +556,41 @@ test("sender identity comes from platform types, not names, message claims or ID
     null,
   );
 });
+
+test("conversation context reads the exact chat or thread with the bot tool", async () => {
+  const x = reactionTransport();
+  const calls: any[] = [];
+  x.transport.runTool = async (botId, request, context) => {
+    calls.push({ botId, request, signal: context.signal });
+    return { ok: true, output: '{"data":{"messages":[]}}' };
+  };
+  const signal = new AbortController().signal;
+  for (const thread of [null, "omt_topic"]) {
+    const read = await x.transport.readConversation(
+      "a",
+      "chat",
+      thread,
+      signal,
+    );
+    assert.equal(read.result.ok, true);
+    assert.deepEqual(read.request.argv, [
+      "im",
+      ...(thread
+        ? ["+threads-messages-list", "--thread", thread]
+        : ["+chat-messages-list", "--chat-id", "chat"]),
+      "--order",
+      "desc",
+      "--page-size",
+      "50",
+      "--no-reactions",
+    ]);
+  }
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].signal, signal);
+  x.transport.runTool = async () => ({ ok: false, output: "missing_scope" });
+  assert.equal(
+    (await x.transport.readConversation("a", "chat", "omt_topic", signal))
+      .result.output,
+    "missing_scope",
+  );
+});

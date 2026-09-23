@@ -114,7 +114,7 @@ test("offline cannot receive; directed human needs explicit authorization; next 
     x.manager.snapshot().revision,
   );
   assert.equal(result.pendingRestart, false);
-  assert.equal(loadConfig(x.file).bindings[0].allowWrites, false);
+  assert.equal(loadConfig(x.file).bindings[0].allowWrites, true);
   assert.deepEqual(x.config.bindings[0].allowedUsers, ["user"]);
   assert.equal(x.store.runs().length, 0); // Approval must not replay old text.
   assert.equal(

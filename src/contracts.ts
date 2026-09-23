@@ -58,6 +58,15 @@ export interface Delivery {
   status?: "accepted" | "result" | "failed" | "cancelled";
 }
 export interface Transport {
+  readConversation?(
+    botId: string,
+    chatId: string,
+    threadId: string | null,
+    signal: AbortSignal,
+  ): Promise<{
+    request: import("./lark-tools.js").LarkToolRequest;
+    result: import("./lark-tools.js").LarkToolResult;
+  }>;
   readContext?(
     botId: string,
     chatId: string,

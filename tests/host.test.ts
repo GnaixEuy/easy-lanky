@@ -1619,3 +1619,97 @@ test("a bot mention cannot use the human direct-message shortcut", async (t) => 
   await s.drain();
   assert.equal(s.sent.filter((d) => d.mode === "direct").length, 0);
 });
+
+test("human conversations default to workspace writes, including legacy observed routes", async (t) => {
+  const s = setup(t);
+  const raw = structuredClone(s.config) as any;
+  delete raw.bindings[0].allowWrites;
+  assert.equal(configSchema.parse(raw).bindings[0].allowWrites, true);
+  raw.bindings[0].allowWrites = false;
+  assert.equal(configSchema.parse(raw).bindings[0].allowWrites, false);
+  s.config.bots[0].projectId = "project";
+  const accepted = s.host.receive(s.message({ chatId: "new-group" }));
+  assert.equal(accepted.status, "accepted");
+  await s.drain();
+  assert.equal(s.calls[0].allowWrites, true);
+  const key = `observed-binding:${s.store.get(accepted.runId!)!.bindingId}`;
+  const row = s.store.db
+    .prepare("SELECT value FROM meta WHERE key=?")
+    .get(key) as { value: string };
+  const saved = JSON.parse(row.value);
+  saved.binding.allowWrites = false;
+  s.store.db
+    .prepare("UPDATE meta SET value=? WHERE key=?")
+    .run(JSON.stringify(saved), key);
+  s.host.receive(s.message({ chatId: "new-group", nativeId: "next" }));
+  await s.drain();
+  assert.equal(s.calls[1].allowWrites, true);
+});
+
+test("ordinary group replies become reference context without triggering tasks", async (t) => {
+  const s = setup(t);
+  const ordinary = s.host.receive(
+    s.message({
+      nativeId: "reply",
+      senderId: "colleague",
+      mentions: [],
+      text: "4点52 有消费",
+    }),
+  );
+  assert.equal(ordinary.status, "not_directed");
+  assert.equal(s.store.runs().length, 0);
+  let reads = 0;
+  s.host.transport.runTool = async () => ({ ok: true, output: "unused" });
+  s.host.transport.readConversation = async (botId, chatId, threadId) => {
+    assert.deepEqual([botId, chatId, threadId], ["a", "chat", null]);
+    reads++;
+    return {
+      request: { argv: ["im", "+chat-messages-list", "--chat-id", chatId] },
+      result: {
+        ok: true,
+        output: JSON.stringify({
+          data: {
+            messages: [
+              {
+                message_id: "reply",
+                sender: { id: "colleague" },
+                content: "4点52 有消费",
+              },
+            ],
+          },
+        }),
+      },
+    };
+  };
+  s.host.receive(s.message({ nativeId: "sync", text: "同步上面的回复" }));
+  await s.drain();
+  assert.equal(reads, 1);
+  assert.match(s.calls[0].toolHistory[0].result.output, /4点52 有消费/);
+  assert.equal(s.calls[0].prompt, "同步上面的回复");
+  assert.deepEqual(s.calls[0].peers, []);
+  assert.equal(s.store.runs().length, 1);
+  s.host.transport.readConversation = async () => ({
+    request: { argv: ["im", "+chat-messages-list"] },
+    result: { ok: false, output: "missing_scope" },
+  });
+  s.host.receive(s.message({ nativeId: "failed-read", text: "刚才说什么" }));
+  await s.drain();
+  assert.equal(s.calls[1].toolHistory[0].result.ok, false);
+  assert.equal(s.calls[1].toolHistory[0].result.output, "missing_scope");
+});
+
+test("revocation during conversation read prevents passing shared history to the model", async (t) => {
+  const s = setup(t);
+  s.host.transport.runTool = async () => ({ ok: true, output: "unused" });
+  s.host.transport.readConversation = async () => {
+    s.config.bots[0].allowedUsers = [];
+    return {
+      request: { argv: ["im", "+chat-messages-list"] },
+      result: { ok: true, output: "private context" },
+    };
+  };
+  const accepted = s.host.receive(s.message());
+  await s.drain();
+  assert.equal(s.calls.length, 0);
+  assert.equal(s.store.get(accepted.runId!)?.state, "failed");
+});

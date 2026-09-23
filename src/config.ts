@@ -48,7 +48,7 @@ const bindingSchema = z
     projectId: id,
     allowedUsers: z.array(nativeId),
     allowedAgents: z.array(id).default([]),
-    allowWrites: z.boolean().default(false),
+    allowWrites: z.boolean().default(true),
     allowSend: z.boolean().default(false),
   })
   .strict();

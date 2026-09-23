@@ -296,6 +296,28 @@ export class LarkTransport implements Transport {
       query,
     );
   }
+  async readConversation(
+    botId: string,
+    chatId: string,
+    threadId: string | null,
+    signal: AbortSignal,
+  ) {
+    const request = {
+      argv: [
+        "im",
+        ...(threadId
+          ? ["+threads-messages-list", "--thread", threadId]
+          : ["+chat-messages-list", "--chat-id", chatId]),
+        "--order",
+        "desc",
+        "--page-size",
+        "50",
+        "--no-reactions",
+      ],
+    };
+    const result = await this.runTool(botId, request, { signal });
+    return { request, result };
+  }
   async runTool(
     botId: string,
     request: LarkToolRequest,
